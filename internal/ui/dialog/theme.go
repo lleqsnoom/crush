@@ -7,7 +7,7 @@ import (
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
-	"github.com/charmbracelet/crush/internal/themes"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/charmbracelet/crush/internal/ui/list"
 	"github.com/charmbracelet/crush/internal/ui/styles"
@@ -17,325 +17,794 @@ import (
 )
 
 const (
-	// ThemeID is the identifier for the theme picker dialog.
-	ThemeID              = "theme"
-	themeDialogMaxWidth  = 50
-	themeDialogMaxHeight = 20
+	ThemeID = "theme"
+
+	// newThemeItemName is the sentinel name for the "New Theme..." entry.
+	newThemeItemName = "__new_theme__"
 )
 
-// ThemePicker is a dialog for browsing and selecting a theme. Navigating
-// the list live-previews the highlighted theme across the whole UI, and the
-// theme names re-render in the newly applied theme's colors.
-type ThemePicker struct {
+type themesMode uint8
+
+const (
+	themesModeNormal themesMode = iota
+	themesModeRenaming
+	themesModeDeleting
+)
+
+// Theme is the theme management dialog. It lists all available themes
+// with shortcuts to switch, rename, and create new themes.
+type Theme struct {
 	com   *common.Common
 	help  help.Model
 	list  *list.FilterableList
 	input textinput.Model
 
-	schemes []themes.Scheme
-	items   []*ThemeItem
+	mode          themesMode
+	selectedIndex int
 
 	keyMap struct {
-		Select   key.Binding
-		Next     key.Binding
-		Previous key.Binding
-		UpDown   key.Binding
-		Close    key.Binding
+		Select        key.Binding
+		Next          key.Binding
+		Previous      key.Binding
+		UpDown        key.Binding
+		EditTheme     key.Binding
+		Rename        key.Binding
+		Revert        key.Binding
+		Delete        key.Binding
+		ConfirmRename key.Binding
+		CancelRename  key.Binding
+		ConfirmDelete key.Binding
+		CancelDelete  key.Binding
+		Close         key.Binding
 	}
 }
 
+// ThemeSectionHeader is a non-selectable section divider in the theme
+// list. It renders as a titled horizontal rule via common.Section.
+type ThemeSectionHeader struct {
+	*list.Versioned
+	title string
+	t     *styles.Styles
+}
+
+func (h *ThemeSectionHeader) Filter() string { return "" }
+func (h *ThemeSectionHeader) Finished() bool { return true }
+func (h *ThemeSectionHeader) Render(width int) string {
+	return common.Section(h.t, " "+h.title+" ", width)
+}
+
+// themeSpacer is a filterable spacer that adds vertical space between
+// sections in the theme list. Unlike list.SpacerItem it satisfies
+// FilterableItem so it can live in a FilterableList.
+type themeSpacer struct {
+	*list.Versioned
+	height int
+}
+
+func (s *themeSpacer) Filter() string          { return "" }
+func (s *themeSpacer) Finished() bool          { return true }
+func (s *themeSpacer) Render(width int) string { return strings.Repeat("\n", s.height) }
+
+// ThemeItem represents a single theme entry in the picker.
 type ThemeItem struct {
 	*list.Versioned
-	scheme    themes.Scheme
-	isCurrent bool
-	t         *styles.Styles
-	m         fuzzy.Match
-	focused   bool
+	name       string
+	label      string
+	isCurrent  bool
+	overridden bool
+	t          *styles.Styles
+	m          fuzzy.Match
+	cache      map[int]string
+	focused    bool
+	hideInfo   bool
+
+	mode        themesMode
+	renameInput textinput.Model
+}
+
+// Finished implements list.Item. Theme items are render-stable outside
+// of explicit SetFocused / SetMatch calls.
+func (r *ThemeItem) Finished() bool {
+	return true
 }
 
 var (
-	_ Dialog   = (*ThemePicker)(nil)
-	_ ListItem = (*ThemeItem)(nil)
+	_ Dialog              = (*Theme)(nil)
+	_ ListItem            = (*ThemeItem)(nil)
+	_ list.FilterableItem = (*ThemeSectionHeader)(nil)
 )
 
-func NewThemePicker(com *common.Common) *ThemePicker {
-	d := &ThemePicker{com: com}
+// NewTheme creates a new theme management dialog.
+func NewTheme(com *common.Common) *Theme {
+	th := &Theme{com: com}
 
 	h := help.New()
 	h.Styles = com.Styles.DialogHelpStyles()
-	d.help = h
+	th.help = h
 
-	d.list = list.NewFilterableList()
-	d.list.Focus()
+	th.list = list.NewFilterableList()
+	th.list.Focus()
 
-	d.input = textinput.New()
-	d.input.SetVirtualCursor(false)
-	d.input.Placeholder = "Type to filter"
-	d.input.SetStyles(com.Styles.TextInput)
-	d.input.Focus()
+	th.input = textinput.New()
+	th.input.SetVirtualCursor(false)
+	th.input.Placeholder = "Type to filter"
+	th.input.SetStyles(com.Styles.TextInput)
+	th.input.Focus()
 
-	d.keyMap.Select = key.NewBinding(
+	th.keyMap.Select = key.NewBinding(
 		key.WithKeys("enter", "ctrl+y"),
+		key.WithHelp("enter", "choose"),
+	)
+	th.keyMap.Next = key.NewBinding(
+		key.WithKeys("down", "ctrl+n"),
+		key.WithHelp("↓", "next item"),
+	)
+	th.keyMap.Previous = key.NewBinding(
+		key.WithKeys("up", "ctrl+p"),
+		key.WithHelp("↑", "previous item"),
+	)
+	th.keyMap.UpDown = key.NewBinding(
+		key.WithKeys("up", "down"),
+		key.WithHelp("↑/↓", "choose"),
+	)
+	th.keyMap.EditTheme = key.NewBinding(
+		key.WithKeys("ctrl+e"),
+		key.WithHelp("ctrl+e", "edit"),
+	)
+	th.keyMap.Rename = key.NewBinding(
+		key.WithKeys("ctrl+r"),
+		key.WithHelp("ctrl+r", "rename"),
+	)
+	th.keyMap.Revert = key.NewBinding(
+		key.WithKeys("ctrl+d"),
+		key.WithHelp("ctrl+d", "revert"),
+	)
+	th.keyMap.Delete = key.NewBinding(
+		key.WithKeys("ctrl+x"),
+		key.WithHelp("ctrl+x", "delete"),
+	)
+	th.keyMap.ConfirmDelete = key.NewBinding(
+		key.WithKeys("y", "enter"),
+		key.WithHelp("y", "delete"),
+	)
+	th.keyMap.CancelDelete = key.NewBinding(
+		key.WithKeys("n", "esc"),
+		key.WithHelp("n", "cancel"),
+	)
+	th.keyMap.ConfirmRename = key.NewBinding(
+		key.WithKeys("enter"),
 		key.WithHelp("enter", "confirm"),
 	)
-	d.keyMap.Next = key.NewBinding(
-		key.WithKeys("down", "ctrl+n"),
-		key.WithHelp("↓", "next theme"),
+	th.keyMap.CancelRename = key.NewBinding(
+		key.WithKeys("esc"),
+		key.WithHelp("esc", "cancel"),
 	)
-	d.keyMap.Previous = key.NewBinding(
-		key.WithKeys("up", "ctrl+p"),
-		key.WithHelp("↑", "previous theme"),
-	)
-	d.keyMap.UpDown = key.NewBinding(
-		key.WithKeys("up", "down"),
-		key.WithHelp("↑/↓", "preview"),
-	)
-	d.keyMap.Close = CloseKey
+	th.keyMap.Close = CloseKey
 
-	d.setItems()
-	return d
+	th.setThemeItems()
+	return th
 }
 
-// ID implements Dialog.
-func (d *ThemePicker) ID() string {
+func (th *Theme) ID() string {
 	return ThemeID
 }
 
-// HandleMsg implements Dialog.
-func (d *ThemePicker) HandleMsg(msg tea.Msg) Action {
-	if kp, ok := msg.(tea.KeyPressMsg); ok {
-		return d.handleKey(kp)
-	}
-	return nil
-}
-
-func (d *ThemePicker) handleKey(msg tea.KeyPressMsg) Action {
-	switch {
-	case key.Matches(msg, d.keyMap.Close):
-		return ActionClose{}
-	case key.Matches(msg, d.keyMap.Previous):
-		return d.moveSelection(-1)
-	case key.Matches(msg, d.keyMap.Next):
-		return d.moveSelection(1)
-	case key.Matches(msg, d.keyMap.Select):
-		item := d.list.SelectedItem()
-		if item == nil {
+// RefreshThemes rebuilds the theme list after on-disk changes (e.g. the
+// theme editor saved an override), so labels like "(overridden)" and the
+// revert keybind update immediately. The selection moves to selectName
+// when it still exists.
+func (th *Theme) RefreshThemes(selectName string) {
+	th.setThemeItems()
+	for i, item := range th.list.FilteredItems() {
+		if ti, ok := item.(*ThemeItem); ok && strings.EqualFold(ti.name, selectName) {
+			th.list.SetSelected(i)
 			break
 		}
-		ti, ok := item.(*ThemeItem)
-		if !ok {
-			break
+	}
+}
+
+// RefreshStyles invalidates cached renders on all theme items so they
+// pick up in-place style mutations after a theme switch or preview.
+func (th *Theme) RefreshStyles() {
+	// The input and help models keep their own copies of style structs,
+	// so re-apply them to pick up the previewed theme's colors.
+	th.input.SetStyles(th.com.Styles.TextInput)
+	th.help.Styles = th.com.Styles.DialogHelpStyles()
+	for _, item := range th.list.FilteredItems() {
+		switch it := item.(type) {
+		case *ThemeItem:
+			it.cache = nil
+			it.Bump()
+		case *ThemeSectionHeader:
+			// Section headers are render-frozen in the list cache, so
+			// bump them to force a re-render with the new styles.
+			it.Bump()
 		}
-		return ActionSelectTheme{Name: ti.scheme.Name}
-	default:
-		prevValue := d.input.Value()
-		var cmd tea.Cmd
-		d.input, cmd = d.input.Update(msg)
-		if d.input.Value() != prevValue {
-			d.list.SetFilter(d.input.Value())
-			d.list.ScrollToTop()
-			d.list.SetSelected(0)
+	}
+}
+
+// isSelectableThemeItem reports whether the item at the given index is a
+// selectable ThemeItem (not a section header or spacer).
+func (th *Theme) isSelectableThemeItem(idx int) bool {
+	items := th.list.FilteredItems()
+	if idx < 0 || idx >= len(items) {
+		return false
+	}
+	_, ok := items[idx].(*ThemeItem)
+	return ok
+}
+
+func hasThemeItem(items []list.Item) bool {
+	for _, item := range items {
+		if _, ok := item.(*ThemeItem); ok {
+			return true
 		}
-		return ActionCmd{cmd}
+	}
+	return false
+}
+
+// hasSelectableTheme reports whether the filtered list contains a theme item.
+func (th *Theme) hasSelectableTheme() bool {
+	return hasThemeItem(th.list.FilteredItems())
+}
+
+// selectNextTheme skips section headers and spacers when moving down.
+func (th *Theme) selectNextTheme() {
+	if !th.hasSelectableTheme() {
+		return
+	}
+	for {
+		if th.list.IsSelectedLast() {
+			th.list.SelectFirst()
+			th.list.ScrollToTop()
+		} else {
+			th.list.SelectNext()
+		}
+		if th.isSelectableThemeItem(th.list.Selected()) {
+			return
+		}
+	}
+}
+
+// selectPrevTheme skips section headers and spacers when moving up.
+func (th *Theme) selectPrevTheme() {
+	if !th.hasSelectableTheme() {
+		return
+	}
+	for {
+		if th.list.IsSelectedFirst() {
+			th.list.SelectLast()
+			th.list.ScrollToBottom()
+		} else {
+			th.list.SelectPrev()
+		}
+		if th.isSelectableThemeItem(th.list.Selected()) {
+			return
+		}
+	}
+}
+
+func (th *Theme) HandleMsg(msg tea.Msg) Action {
+	switch msg := msg.(type) {
+	case tea.KeyPressMsg:
+		switch th.mode {
+		case themesModeDeleting:
+			switch {
+			case key.Matches(msg, th.keyMap.ConfirmDelete):
+				action := th.confirmDelete()
+				th.mode = themesModeNormal
+				th.setThemeItems()
+				return action
+			case key.Matches(msg, th.keyMap.CancelDelete):
+				th.mode = themesModeNormal
+				th.setThemeItems()
+			}
+		case themesModeRenaming:
+			switch {
+			case key.Matches(msg, th.keyMap.ConfirmRename):
+				action := th.confirmRename()
+				th.setThemeItems()
+				return action
+			case key.Matches(msg, th.keyMap.CancelRename):
+				th.mode = themesModeNormal
+				th.setThemeItems()
+			default:
+				item := th.list.SelectedItem()
+				if item == nil {
+					return nil
+				}
+				if themeItem, ok := item.(*ThemeItem); ok {
+					return themeItem.HandleInput(msg)
+				}
+			}
+		default:
+			switch {
+			case key.Matches(msg, th.keyMap.Close):
+				return ActionRevertThemePreview{}
+			case key.Matches(msg, th.keyMap.EditTheme):
+				selectedItem := th.list.SelectedItem()
+				if selectedItem == nil {
+					break
+				}
+				themeItem, ok := selectedItem.(*ThemeItem)
+				if !ok || themeItem.name == newThemeItemName {
+					break
+				}
+				return ActionEditTheme{Name: themeItem.name}
+			case key.Matches(msg, th.keyMap.Rename):
+				selectedItem := th.list.SelectedItem()
+				if selectedItem == nil {
+					break
+				}
+				themeItem, ok := selectedItem.(*ThemeItem)
+				if !ok || themeItem.name == newThemeItemName {
+					break
+				}
+				if styles.IsBuiltinTheme(themeItem.name) {
+					break
+				}
+				th.selectedIndex = th.list.Selected()
+				th.mode = themesModeRenaming
+				th.setThemeItems()
+			case key.Matches(msg, th.keyMap.Delete):
+				if !th.canDeleteSelected() {
+					break
+				}
+				th.selectedIndex = th.list.Selected()
+				th.mode = themesModeDeleting
+				th.setThemeItems()
+			case key.Matches(msg, th.keyMap.Revert):
+				selectedItem := th.list.SelectedItem()
+				if selectedItem == nil {
+					break
+				}
+				themeItem, ok := selectedItem.(*ThemeItem)
+				if !ok || themeItem.name == newThemeItemName || !themeItem.overridden {
+					break
+				}
+				return ActionRevertOverriddenTheme{Name: themeItem.name}
+			case key.Matches(msg, th.keyMap.Previous):
+				th.list.Focus()
+				th.selectPrevTheme()
+				th.list.ScrollToSelected()
+				return th.previewAction()
+			case key.Matches(msg, th.keyMap.Next):
+				th.list.Focus()
+				th.selectNextTheme()
+				th.list.ScrollToSelected()
+				return th.previewAction()
+			case key.Matches(msg, th.keyMap.Select):
+				selectedItem := th.list.SelectedItem()
+				if selectedItem == nil {
+					break
+				}
+				themeItem, ok := selectedItem.(*ThemeItem)
+				if !ok {
+					break
+				}
+				if themeItem.name == newThemeItemName {
+					return ActionOpenDialog{ThemeNewID}
+				}
+				return ActionSwitchTheme{Theme: themeItem.name}
+			default:
+				var cmd tea.Cmd
+				th.input, cmd = th.input.Update(msg)
+				value := th.input.Value()
+				th.list.SetFilter(value)
+				th.list.ScrollToTop()
+				// Select first selectable item after filtering.
+				th.list.SetSelected(0)
+				if !th.isSelectableThemeItem(0) {
+					th.selectNextTheme()
+				}
+				return ActionCmd{cmd}
+			}
+		}
 	}
 	return nil
 }
 
-func (d *ThemePicker) moveSelection(delta int) Action {
-	d.list.Focus()
-	if delta < 0 {
-		if d.list.IsSelectedFirst() {
-			d.list.SelectLast()
-			d.list.ScrollToBottom()
-		} else {
-			d.list.SelectPrev()
-			d.list.ScrollToSelected()
-		}
-	} else {
-		if d.list.IsSelectedLast() {
-			d.list.SelectFirst()
-			d.list.ScrollToTop()
-		} else {
-			d.list.SelectNext()
-			d.list.ScrollToSelected()
-		}
+func (th *Theme) confirmDelete() Action {
+	item := th.selectedThemeItem()
+	if item == nil || item.name == newThemeItemName {
+		return nil
 	}
-	d.bumpItems()
-	return d.previewAction()
+	return ActionDeleteTheme{Name: item.name}
 }
 
-func (d *ThemePicker) previewAction() Action {
-	item := d.list.SelectedItem()
-	if ti, ok := item.(*ThemeItem); ok && ti != nil {
-		return ActionPreviewTheme{Name: ti.scheme.Name}
+// canDeleteSelected reports whether the currently selected theme item
+// supports deletion (user-defined, not the sentinel). Built-in themes
+// and overrides use revert instead.
+func (th *Theme) canDeleteSelected() bool {
+	item := th.selectedThemeItem()
+	if item == nil || item.name == newThemeItemName {
+		return false
+	}
+	return !styles.IsBuiltinTheme(item.name)
+}
+
+func (th *Theme) confirmRename() Action {
+	item := th.selectedThemeItem()
+	th.mode = themesModeNormal
+	if item == nil {
+		return nil
+	}
+	newName := strings.TrimSpace(item.InputValue())
+	if newName == "" {
+		return nil
+	}
+	oldName := item.name
+	if strings.EqualFold(newName, oldName) {
+		return nil
+	}
+	return ActionRenameTheme{OldName: oldName, NewName: newName}
+}
+
+func (th *Theme) selectedThemeItem() *ThemeItem {
+	if item := th.list.SelectedItem(); item != nil {
+		if ti, ok := item.(*ThemeItem); ok {
+			return ti
+		}
 	}
 	return nil
 }
 
-// bumpItems bumps every item's version so the list re-renders them in the
-// newly applied theme on the next draw.
-func (d *ThemePicker) bumpItems() {
-	for _, it := range d.items {
-		it.Bump()
+func (th *Theme) previewAction() Action {
+	selectedItem := th.list.SelectedItem()
+	if selectedItem == nil {
+		return nil
 	}
+	themeItem, ok := selectedItem.(*ThemeItem)
+	if !ok || themeItem.name == newThemeItemName {
+		return nil
+	}
+	return ActionPreviewTheme{Theme: themeItem.name}
 }
 
-// Cursor returns the cursor position relative to the dialog.
-func (d *ThemePicker) Cursor() *tea.Cursor {
-	return InputCursor(d.com.Styles, d.input.Cursor())
+// currentThemeName returns the active theme name from config, defaulting
+// to the built-in default when unset.
+func (th *Theme) currentThemeName() string {
+	cfg := th.com.Config()
+	if cfg == nil || cfg.Options == nil || cfg.Options.TUI == nil || cfg.Options.TUI.ActiveTheme == "" {
+		return "charmtone-panther"
+	}
+	return cfg.Options.TUI.ActiveTheme
 }
 
-// Draw implements Dialog.
-func (d *ThemePicker) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
-	t := d.com.Styles
-	width := max(0, min(themeDialogMaxWidth, area.Dx()-t.Dialog.View.GetHorizontalBorderSize()))
-	height := max(0, min(themeDialogMaxHeight, area.Dy()-t.Dialog.View.GetVerticalBorderSize()))
+func (th *Theme) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	t := th.com.Styles
+	width := max(0, min(defaultDialogMaxWidth, area.Dx()-t.Dialog.View.GetHorizontalBorderSize()))
+	height := max(0, min(defaultDialogHeight, area.Dy()-t.Dialog.View.GetVerticalBorderSize()))
 	innerWidth := width - t.Dialog.View.GetHorizontalFrameSize()
 
-	d.input.SetWidth(dialogInputTextWidth(t, d.input, innerWidth))
+	th.input.SetWidth(dialogInputTextWidth(t, th.input, innerWidth))
+	listHeight, listTotalHeight, _ := sizeDialogList(t, th.list, innerWidth, height)
 
-	heightOffset := t.Dialog.Title.GetVerticalFrameSize() + titleContentHeight +
-		t.Dialog.InputPrompt.GetVerticalFrameSize() + inputContentHeight +
-		t.Dialog.HelpView.GetVerticalFrameSize() +
-		t.Dialog.View.GetVerticalFrameSize()
-
-	d.list.SetSize(innerWidth, max(0, height-heightOffset))
-
+	var cur *tea.Cursor
 	rc := NewRenderContext(t, width)
-	rc.Title = "Theme"
-	inputView := t.Dialog.InputPrompt.Render(d.input.View())
-	rc.AddPart(inputView)
-
-	if d.list.Height() >= len(d.list.FilteredItems()) {
-		d.list.ScrollToTop()
-	} else {
-		d.list.ScrollToSelected()
+	rc.Title = "Themes"
+	switch th.mode {
+	case themesModeDeleting:
+		rc.TitleStyle = t.Dialog.Sessions.DeletingTitle
+		rc.TitleGradientFromColor = t.Dialog.Sessions.DeletingTitleGradientFromColor
+		rc.TitleGradientToColor = t.Dialog.Sessions.DeletingTitleGradientToColor
+		rc.ViewStyle = t.Dialog.Sessions.DeletingView
+		rc.AddPart(t.Dialog.Sessions.DeletingMessage.Render("Delete this theme?"))
+	case themesModeRenaming:
+		rc.TitleStyle = t.Dialog.Sessions.RenamingingTitle
+		rc.TitleGradientFromColor = t.Dialog.Sessions.RenamingTitleGradientFromColor
+		rc.TitleGradientToColor = t.Dialog.Sessions.RenamingTitleGradientToColor
+		rc.ViewStyle = t.Dialog.Sessions.RenamingView
+		message := t.Dialog.Sessions.RenamingingMessage.Render("Rename this theme?")
+		rc.AddPart(message)
+		item := th.selectedThemeItem()
+		if item == nil {
+			return nil
+		}
+		cur = item.Cursor()
+		start, end := th.list.VisibleItemIndices()
+		cur = renameCursorOffset(t, cur, lipgloss.Height(message), start, end, th.list.Selected())
+	default:
+		inputView := t.Dialog.InputPrompt.Render(th.input.View())
+		rc.AddPart(inputView)
+		cur = InputCursor(t, th.input.Cursor())
 	}
 
-	listView := t.Dialog.List.Height(d.list.Height()).Render(d.list.Render())
+	visibleCount := len(th.list.FilteredItems())
+	if th.list.Height() >= visibleCount {
+		th.list.ScrollToTop()
+	} else {
+		th.list.ScrollToSelected()
+	}
+
+	listView := t.Dialog.List.Height(th.list.Height()).Render(th.list.Render())
+	listView = joinScrollbar(t, listView, listHeight, listTotalHeight, listHeight, th.list.Offset())
 	rc.AddPart(listView)
-	rc.Help = renderDialogHelp(t, &d.help, d, innerWidth)
+	rc.Help = renderDialogHelp(t, &th.help, th, innerWidth)
 
 	view := rc.Render()
-	cur := d.Cursor()
+
 	DrawCenterCursor(scr, area, view, cur)
 	return cur
 }
 
-// ShortHelp implements help.KeyMap.
-func (d *ThemePicker) ShortHelp() []key.Binding {
-	return []key.Binding{
-		d.keyMap.UpDown,
-		d.keyMap.Select,
-		d.keyMap.Close,
+// canRenameSelected reports whether the currently selected theme item
+// supports renaming (user-defined, not the sentinel).
+func (th *Theme) canRenameSelected() bool {
+	item := th.selectedThemeItem()
+	if item == nil || item.name == newThemeItemName {
+		return false
 	}
+	return !styles.IsBuiltinTheme(item.name)
 }
 
-// FullHelp implements help.KeyMap.
-func (d *ThemePicker) FullHelp() [][]key.Binding {
-	m := [][]key.Binding{}
-	slice := []key.Binding{
-		d.keyMap.Select,
-		d.keyMap.Next,
-		d.keyMap.Previous,
-		d.keyMap.Close,
-	}
-	for i := 0; i < len(slice); i += 4 {
-		end := min(i+4, len(slice))
-		m = append(m, slice[i:end])
-	}
-	return m
+// canEditSelected reports whether the currently selected theme item
+// supports editing (not the sentinel).
+func (th *Theme) canEditSelected() bool {
+	item := th.selectedThemeItem()
+	return item != nil && item.name != newThemeItemName
 }
 
-func (d *ThemePicker) setItems() {
-	current := d.currentThemeName()
+// canRevertSelected reports whether the currently selected theme item is a
+// built-in whose colors have been overridden, so it can be reset to the
+// original built-in palette.
+func (th *Theme) canRevertSelected() bool {
+	item := th.selectedThemeItem()
+	return item != nil && item.name != newThemeItemName && item.overridden
+}
 
-	d.schemes = themes.Catalog()
-	items := make([]list.FilterableItem, 0, len(d.schemes))
-	themeItems := make([]*ThemeItem, 0, len(d.schemes))
-	selectedIndex := 0
-	for _, s := range d.schemes {
-		isCurrent := strings.EqualFold(s.Name, current)
-		item := &ThemeItem{
-			Versioned: list.NewVersioned(),
-			scheme:    s,
-			isCurrent: isCurrent,
-			t:         d.com.Styles,
+func (th *Theme) ShortHelp() []key.Binding {
+	switch th.mode {
+	case themesModeDeleting:
+		return []key.Binding{
+			th.keyMap.ConfirmDelete,
+			th.keyMap.CancelDelete,
 		}
-		if isCurrent {
-			selectedIndex = len(items)
+	case themesModeRenaming:
+		return []key.Binding{
+			th.keyMap.ConfirmRename,
+			th.keyMap.CancelRename,
 		}
-		items = append(items, item)
-		themeItems = append(themeItems, item)
 	}
-	d.items = themeItems
-
-	d.list.SetItems(items...)
-	d.list.SetSelected(selectedIndex)
-	d.list.ScrollToSelected()
-}
-
-func (d *ThemePicker) currentThemeName() string {
-	if d.com == nil || d.com.Workspace == nil {
-		return "default"
+	bindings := []key.Binding{
+		th.keyMap.UpDown,
 	}
-	if name := themes.ConfiguredTheme(d.com.Workspace.Config()); name != "" {
-		return name
+	if th.mode == themesModeNormal {
+		if th.canEditSelected() {
+			bindings = append(bindings, th.keyMap.EditTheme)
+		}
+		if th.canRenameSelected() {
+			bindings = append(bindings, th.keyMap.Rename)
+		}
+		if th.canRevertSelected() {
+			bindings = append(bindings, th.keyMap.Revert)
+		}
+		if th.canDeleteSelected() {
+			bindings = append(bindings, th.keyMap.Delete)
+		}
 	}
-	if d.com.IsHyper() {
-		return "hyper"
+	bindings = append(bindings, th.keyMap.Select, th.keyMap.Close)
+	return bindings
+}
+
+func (th *Theme) FullHelp() [][]key.Binding {
+	if th.mode == themesModeRenaming {
+		return [][]key.Binding{{th.keyMap.ConfirmRename, th.keyMap.CancelRename}}
 	}
-	return "default"
+	if th.mode == themesModeDeleting {
+		return [][]key.Binding{{th.keyMap.ConfirmDelete, th.keyMap.CancelDelete}}
+	}
+	row2 := []key.Binding{th.keyMap.Close}
+	if th.canRevertSelected() {
+		row2 = append([]key.Binding{th.keyMap.Revert}, row2...)
+	}
+	if th.canDeleteSelected() {
+		row2 = append([]key.Binding{th.keyMap.Delete}, row2...)
+	}
+	if th.canRenameSelected() {
+		row2 = append([]key.Binding{th.keyMap.Rename}, row2...)
+	}
+	if th.canEditSelected() {
+		row2 = append([]key.Binding{th.keyMap.EditTheme}, row2...)
+	}
+	return [][]key.Binding{
+		{th.keyMap.Select, th.keyMap.Next, th.keyMap.Previous},
+		row2,
+	}
 }
 
-func (i *ThemeItem) Filter() string {
-	return i.scheme.Name
+func (th *Theme) setThemeItems() {
+	currentTheme := th.currentThemeName()
+	allThemes := styles.ListAllThemes()
+
+	// Separate builtin (including overridden) from user-only themes.
+	var systemThemes, userThemes []styles.ThemeInfo
+	for _, info := range allThemes {
+		if info.Source == styles.ThemeSourceBuiltin || info.Overridden {
+			systemThemes = append(systemThemes, info)
+		} else {
+			userThemes = append(userThemes, info)
+		}
+	}
+
+	items := make([]list.FilterableItem, 0, len(allThemes)+5)
+
+	// "New Theme..." sentinel — no divider above it.
+	items = append(items, &ThemeItem{
+		Versioned: &list.Versioned{},
+		name:      newThemeItemName,
+		label:     "New Theme...",
+		t:         th.com.Styles,
+		mode:      th.mode,
+	})
+
+	// Spacer after "New Theme...".
+	items = append(items, &themeSpacer{Versioned: &list.Versioned{}, height: 1})
+
+	// System section.
+	items = append(items, &ThemeSectionHeader{
+		Versioned: &list.Versioned{},
+		title:     "System",
+		t:         th.com.Styles,
+	})
+	for _, info := range systemThemes {
+		items = append(items, th.newThemeItem(info, currentTheme))
+	}
+
+	// User section — only shown when custom themes exist.
+	if len(userThemes) > 0 {
+		items = append(items, &themeSpacer{Versioned: &list.Versioned{}, height: 1})
+		items = append(items, &ThemeSectionHeader{
+			Versioned: &list.Versioned{},
+			title:     "User",
+			t:         th.com.Styles,
+		})
+		for _, info := range userThemes {
+			items = append(items, th.newThemeItem(info, currentTheme))
+		}
+	}
+
+	th.list.SetItems(items...)
+
+	// Restore selection or default to the currently active theme, matching
+	// the behavior of the session and model pickers.
+	switch {
+	case (th.mode == themesModeRenaming || th.mode == themesModeDeleting) &&
+		th.selectedIndex >= 0 && th.selectedIndex < len(items):
+		th.list.SetSelected(th.selectedIndex)
+	default:
+		selected := 0
+		for i, it := range items {
+			if ti, ok := it.(*ThemeItem); ok && strings.EqualFold(ti.name, currentTheme) && ti.name != newThemeItemName {
+				selected = i
+				break
+			}
+		}
+		th.list.SetSelected(selected)
+	}
+	th.list.ScrollToSelected()
 }
 
-func (i *ThemeItem) ID() string {
-	return i.scheme.Name
+func (th *Theme) newThemeItem(info styles.ThemeInfo, currentTheme string) *ThemeItem {
+	label := info.Name
+	if info.Overridden {
+		label += " (overridden)"
+	}
+	item := &ThemeItem{
+		Versioned:  &list.Versioned{},
+		name:       info.Name,
+		label:      label,
+		isCurrent:  strings.EqualFold(info.Name, currentTheme),
+		overridden: info.Overridden,
+		t:          th.com.Styles,
+		mode:       th.mode,
+	}
+	if th.mode == themesModeRenaming && th.selectedIndex >= 0 {
+		filteredItems := th.list.FilteredItems()
+		if th.selectedIndex < len(filteredItems) {
+			if si, ok := filteredItems[th.selectedIndex].(*ThemeItem); ok && si.name == info.Name {
+				item.renameInput = textinput.New()
+				item.renameInput.SetVirtualCursor(false)
+				item.renameInput.Prompt = ""
+				inputStyle := th.com.Styles.TextInput
+				inputStyle.Focused.Placeholder = th.com.Styles.Dialog.Sessions.RenamingPlaceholder
+				item.renameInput.SetStyles(inputStyle)
+				item.renameInput.SetValue(info.Name)
+				item.renameInput.Focus()
+			}
+		}
+	}
+	return item
 }
 
-// Finished implements list.Item. Theme items are render-stable outside of
-// explicit SetFocused / SetMatch calls and the version bumps that signal a
-// live theme change.
-func (i *ThemeItem) Finished() bool {
-	return true
+func (r *ThemeItem) Filter() string {
+	return r.label
 }
 
-func (i *ThemeItem) SetFocused(focused bool) {
-	if i.focused == focused {
+func (r *ThemeItem) ID() string {
+	return r.name
+}
+
+func (r *ThemeItem) SetFocused(focused bool) {
+	if r.focused != focused {
+		r.cache = nil
+		r.Bump()
+	}
+	r.focused = focused
+}
+
+func (r *ThemeItem) SetMatch(m fuzzy.Match) {
+	if !sameFuzzyMatch(r.m, m) {
+		r.cache = nil
+		r.Bump()
+	}
+	r.m = m
+}
+
+// InfoText returns the secondary text shown on the right of the item.
+func (r *ThemeItem) InfoText() string {
+	if r.isCurrent {
+		return "current"
+	}
+	return ""
+}
+
+// SetHideInfo controls whether the info column is shown.
+func (r *ThemeItem) SetHideInfo(v bool) {
+	if r.hideInfo == v {
 		return
 	}
-	i.focused = focused
-	if i.Versioned != nil {
-		i.Bump()
+	r.cache = nil
+	r.hideInfo = v
+	if r.Versioned != nil {
+		r.Bump()
 	}
 }
 
-func (i *ThemeItem) SetMatch(m fuzzy.Match) {
-	if sameFuzzyMatch(i.m, m) {
-		return
-	}
-	i.m = m
-	if i.Versioned != nil {
-		i.Bump()
-	}
+func (r *ThemeItem) InputValue() string {
+	return r.renameInput.Value()
 }
 
-// Render styles the item with the currently applied theme's list colors.
-func (i *ThemeItem) Render(width int) string {
-	style := i.t.Dialog.NormalItem
-	if i.focused {
-		style = i.t.Dialog.SelectedItem
+func (r *ThemeItem) HandleInput(msg tea.Msg) tea.Cmd {
+	var cmd tea.Cmd
+	r.renameInput, cmd = r.renameInput.Update(msg)
+	if r.Versioned != nil {
+		r.Bump()
 	}
-	lineWidth := max(0, width-style.GetHorizontalFrameSize())
+	return cmd
+}
 
-	name := i.scheme.Name
-	if i.isCurrent {
-		name += " (current)"
+func (r *ThemeItem) Cursor() *tea.Cursor {
+	return r.renameInput.Cursor()
+}
+
+func (r *ThemeItem) Render(width int) string {
+	info := r.InfoText()
+	if r.hideInfo {
+		info = ""
 	}
-	name = ansi.Truncate(name, lineWidth, "…")
+	s := ListItemStyles{
+		ItemBlurred:     r.t.Dialog.NormalItem,
+		ItemFocused:     r.t.Dialog.SelectedItem,
+		InfoTextBlurred: r.t.Dialog.Sessions.InfoBlurred,
+		InfoTextFocused: r.t.Dialog.Sessions.InfoFocused,
+	}
 
-	return style.Render(name)
+	switch r.mode {
+	case themesModeDeleting:
+		s.ItemBlurred = r.t.Dialog.Sessions.DeletingItemBlurred
+		s.ItemFocused = r.t.Dialog.Sessions.DeletingItemFocused
+	case themesModeRenaming:
+		s.ItemBlurred = r.t.Dialog.Sessions.RenamingItemBlurred
+		s.ItemFocused = r.t.Dialog.Sessions.RenamingingItemFocused
+		if r.focused {
+			const cursorPadding = 1
+			inputWidth := max(0, width-s.ItemFocused.GetHorizontalFrameSize()-cursorPadding)
+			r.renameInput.SetWidth(inputWidth)
+			r.renameInput.Placeholder = ansi.Truncate(r.label, width, "…")
+			return s.ItemFocused.Render(r.renameInput.View())
+		}
+	}
+
+	return renderItem(s, r.label, info, r.focused, width, r.cache, &r.m)
 }
